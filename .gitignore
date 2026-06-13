@@ -251,3 +251,8 @@ uv.lock
 # package shadows the maturin overlay on sys.path.
 /headroom/_core.*.so
 /headroom/_core.so
+
+# AOS-M.1 lokale artefacten (niet committen)
+hf-mirror/
+.venv/
+deploy/p920/.env

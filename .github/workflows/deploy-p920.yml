@@ -1,0 +1,60 @@
+# AOS-M.1 — CI/CD deploy van headroom (from-source + offline Kompress) op P920.
+# P8: geen handmatige changes op P920 — alles via deze workflow. P22: from-source build.
+#
+# Pre-condities (Eddie, eenmalig):
+#   1. Self-hosted runner op P920 met label `p920` voor repo zeeneddie/headroom.
+#   2. Repo-secret HEADROOM_UPSTREAM_URL = de MarQed LiteLLM-gateway-URL (OpenAI-compatible).
+#   (optioneel) HEADROOM_BIND_IP / HEADROOM_PORT als de defaults 100.84.112.24:8790 niet passen.
+
+name: deploy-p920
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/p920/**"
+      - "Dockerfile"
+      - "headroom/**"
+      - ".github/workflows/deploy-p920.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: headroom-p920
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, p920]
+    defaults:
+      run:
+        working-directory: deploy/p920
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render .env
+        run: |
+          {
+            echo "HEADROOM_UPSTREAM_URL=${{ secrets.HEADROOM_UPSTREAM_URL }}"
+            echo "HEADROOM_BIND_IP=${{ vars.HEADROOM_BIND_IP || '100.84.112.24' }}"
+            echo "HEADROOM_PORT=${{ vars.HEADROOM_PORT || '8790' }}"
+          } > .env
+
+      - name: Build from source (P22 — geen image-pull van headroom)
+        run: docker compose --env-file .env build
+
+      - name: Seed offline Kompress-model (eenmalig per volume; idempotent)
+        run: docker compose --env-file .env run --rm model-seed
+
+      - name: Deploy (force-recreate — Tailscale boot-race-safe)
+        run: docker compose --env-file .env up -d --force-recreate headroom-proxy
+
+      - name: Smoke — wacht op healthy + /stats bereikbaar
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose --env-file .env exec -T headroom-proxy \
+                 curl -fsS http://127.0.0.1:8787/readyz >/dev/null 2>&1; then
+              echo "headroom proxy healthy"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::headroom proxy niet healthy binnen 150s"; docker compose --env-file .env logs --tail 40 headroom-proxy; exit 1
