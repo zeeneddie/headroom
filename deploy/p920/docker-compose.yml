@@ -1,0 +1,88 @@
+# AOS-M.1 — headroom op P920 (test/acceptatie), from-source + offline Kompress-model.
+#
+# Egress-invariant (ADR-074 §B3a): de proxy draait met HF_HUB_OFFLINE=1 en mount het
+# vooraf-geseede Kompress-model read-only. De ENIGE netwerk-fetch is de eenmalige
+# `model-seed`-stap (controlled init, niet op het klant-pad). From-source (P22): de
+# image wordt uit de Dockerfile gebouwd, geen ghcr/-image-pull.
+#
+# Tailscale-only: publiceer op het tailnet-IP. Na reboot van P920 draait de container
+# "healthy" maar de poort kan dood zijn (docker start vóór tailscale0-IP) → gebruik
+# `compose up -d --force-recreate` (NIET `docker restart`). Zie README.
+
+x-build: &from-source
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+    args:
+      HEADROOM_EXTRAS: proxy,code   # onnxruntime+hf_hub+tokenizers → Kompress-ONNX (geen torch nodig)
+
+services:
+  # Eenmalige seed: downloadt chopratejas/kompress-v2-base in het offline-volume (network on, 1x).
+  model-seed:
+    <<: *from-source
+    image: headroom-aos:latest
+    entrypoint: ["python"]
+    command:
+      - "-c"
+      - "from huggingface_hub import snapshot_download; p=snapshot_download('chopratejas/kompress-v2-base'); print('seeded kompress-v2-base ->', p)"
+    environment:
+      - HF_HUB_ENABLE_HF_TRANSFER=0
+    volumes:
+      - headroom_models:/home/nonroot/.cache/huggingface
+    restart: "no"
+
+  headroom-proxy:
+    <<: *from-source
+    image: headroom-aos:latest
+    depends_on:
+      model-seed:
+        condition: service_completed_successfully
+    command: ["--host", "0.0.0.0"]
+    environment:
+      # --- offline-mirror (egress-invariant) ---
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      # --- compressie-config (AOS-M.1-bevindingen) ---
+      - HEADROOM_COMPRESS_USER_MESSAGES=1
+      - HEADROOM_COMPRESS_SYSTEM_MESSAGES=1
+      - HEADROOM_FORCE_KOMPRESS=1
+      - HEADROOM_KOMPRESS_BACKEND=onnx
+      - HEADROOM_MIN_TOKENS=${HEADROOM_MIN_TOKENS:-200}
+      - HEADROOM_SAVINGS_TARGET=${HEADROOM_SAVINGS_TARGET:-0.50}
+      # --- upstream = de MarQed LiteLLM-gateway (headroom comprimeert → LiteLLM → providers) ---
+      - OPENAI_TARGET_API_URL=${HEADROOM_UPSTREAM_URL:?zet HEADROOM_UPSTREAM_URL naar de LiteLLM-gateway}
+    volumes:
+      - headroom_models:/home/nonroot/.cache/huggingface:ro
+    ports:
+      # Tailscale-only: bind op het tailnet-IP van P920 (marqed003 = 100.84.112.24).
+      - "${HEADROOM_BIND_IP:-100.84.112.24}:${HEADROOM_PORT:-8790}:8787"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # OPTIONEEL (profiel `semantic`) — qdrant + neo4j voor de semantische/multi-hop-memory-laag
+  # BÓVENOP token-compressie. NIET nodig voor AOS-M.1 core (Kompress draait standalone).
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    profiles: ["semantic"]
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.26
+    profiles: ["semantic"]
+    environment:
+      - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/headroom-aos}
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+
+volumes:
+  headroom_models:
+  qdrant_data:
+  neo4j_data:
